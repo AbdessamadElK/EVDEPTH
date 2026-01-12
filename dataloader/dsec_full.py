@@ -5,31 +5,44 @@ import torch.utils.data as data
 import random
 import os
 import glob
+from pathlib import Path
 
-from augment import Augmentor
-from representation import VoxelGrid
+from .augment import Augmentor
+
+import imageio.v2 as imageio
 
 class DSECfull(data.Dataset):
     def __init__(self, phase):
         self.init_seed = False
         self.phase = phase
-        self.representation = VoxelGrid((15, 480, 640), normalize=True)
         self.files = []
         self.flows = []
 
+        assert self.phase in ["train", "trainval", "test", "prog"]
+
+        crop_size = [288, 384]
+        flip = True
+
         ### Please change the root to satisfy your data saving setting.
-        root = 'datasets/dsec_full'
+        root = 'C:/users/abdessamad/TMA/datasets/dsec_full'
         if phase == 'train' or phase == 'trainval':
             self.root = os.path.join(root, 'trainval')
-            self.augmentor = Augmentor(crop_size=[288, 384])
+            self.augmentor = Augmentor(crop_size, do_flip=flip)
         else:
             self.root = os.path.join(root, 'test')
 
+        if phase == 'prog':
+            self.augment = False
+            self.root = 'datasets/dsec_prog/trainval'
 
-        self.files = glob.glob(os.path.join(self.root, '*', '*.npz'))
+        self.files = glob.glob(os.path.join(self.root, '*', 'voxel_grids', '*.npz'))
         self.files.sort()
-        self.flows = glob.glob(os.path.join(self.root, '*', 'flow_*.npy'))
-        self.flows.sort()
+
+        self.depths = glob.glob(os.path.join(self.root, '*', 'depth_gt', "*.png"))
+        self.depths.sort()
+
+        self.images = glob.glob(os.path.join(self.root, '*', 'images_original', "*.png"))
+        self.depths.sort()
 
     def events_to_voxel_grid(self, x, y, p, t):
         t = (t - t[0]).astype('float32')
@@ -57,35 +70,37 @@ class DSECfull(data.Dataset):
         
         #events
         events_file = np.load(self.files[index])
-        events1 = events_file['events_prev']
-        x = events1[:, 0]
-        y = events1[:, 1]
-        t = events1[:, 2]
-        p = events1[:, 3]
-        voxel1 = self.events_to_voxel_grid(x, y, p, t).permute(1, 2, 0).numpy()
+        event_voxel = events_file['events_curr'].transpose(1, 2, 0)
 
-        events2 = events_file['events_curr']
-        x = events2[:, 0]
-        y = events2[:, 1]
-        t = events2[:, 2]
-        p = events2[:, 3]
-        voxel2 = self.events_to_voxel_grid(x, y, p, t).permute(1, 2, 0).numpy()        
+        img = imageio.imread(self.images[index])
 
-        #flow
-        flow_16bit = np.load(self.flows[index])
-        flow_map, valid2D = flow_16bit_to_float(flow_16bit)
-        if self.phase == 'train':
-            voxel1, voxel2, flow_map, valid2D = self.augmentor(voxel1, voxel2, flow_map, valid2D)
-        
-        voxel1 = torch.from_numpy(voxel1).permute(2, 0, 1).float()
-        voxel2 = torch.from_numpy(voxel2).permute(2, 0, 1).float()
-        flow_map = torch.from_numpy(flow_map).permute(2, 0, 1).float()
-        valid2D = torch.from_numpy(valid2D).float()
-        return voxel1, voxel2, flow_map, valid2D
+        if self.phase != 'test':
+            depth_16bit = imageio.imread(self.depths[index], format="PNG-FI")
+            depth = depth_16bit.astype(np.float32) / 256.0
+            valid2D = (depth > 0).astype(int)
+
+            if self.phase == 'train':
+                event_voxel, depth, valid2D, img= self.augmentor(event_voxel, depth, valid2D, img)
+
+            img = torch.from_numpy(img).permute(2, 0, 1).float()
+            depth = torch.from_numpy(depth).unsqueeze(0).float()
+            valid2D = torch.from_numpy(valid2D).float()
+
+        if self.phase == 'test':
+            # Include submission coordinates (seuence name, file index)
+            file_path = Path(self.files[index])
+            sequence_name = file_path.parents[1].name
+            file_index = int(file_path.stem)
+            submission_coords = (sequence_name, file_index)
+            return event_voxel, img, submission_coords
+    
+        event_voxel = torch.from_numpy(event_voxel).permute(2, 0, 1).float()
+        return event_voxel, depth, valid2D, img
     
     def __len__(self):
         return len(self.files)
-    
+
+
 def flow_16bit_to_float(flow_16bit: np.ndarray):
     assert flow_16bit.dtype == np.uint16
     assert flow_16bit.ndim == 3
@@ -117,8 +132,7 @@ def make_data_loader(phase, batch_size, num_workers):
     return loader
 
 if __name__ == '__main__':
-
-    dset = DSECfull('test')
+    dset = DSECfull('train')
     print(len(dset))
-    v1, v2, flow, valid = dset[0]
-    print(v1.shape, v2.shape, flow.shape, valid.shape)
+    voxel, depth, valid, img = dset[0]
+    print(voxel.shape, depth.shape, valid.shape, img.shape)
